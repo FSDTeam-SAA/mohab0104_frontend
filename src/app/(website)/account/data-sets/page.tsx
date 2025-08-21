@@ -158,22 +158,115 @@ export default function DynamicUserDashboard() {
       setError(null);
 
       let jsonData;
+
       if (
         selectedDataSetObj.dataSets.startsWith("data:application/json;base64,")
       ) {
+        // Handle base64 encoded JSON
         const base64Data = selectedDataSetObj.dataSets.split(",")[1];
         const jsonString = atob(base64Data);
         jsonData = JSON.parse(jsonString);
-      } else {
+      } else if (selectedDataSetObj.dataSets.startsWith("http")) {
+        // Handle URL data sources
         const response = await fetch(selectedDataSetObj.dataSets);
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(
+            `Failed to fetch data: ${response.status} ${response.statusText}`
+          );
         }
-        jsonData = await response.json();
+
+        const responseText = await response.text();
+
+        // Try to parse as regular JSON first
+        try {
+          jsonData = JSON.parse(responseText);
+        } catch {
+          // If that fails, try parsing as JSONL (JSON Lines format)
+          try {
+            const lines = responseText
+              .trim()
+              .split("\n")
+              .filter((line) => line.trim());
+            jsonData = lines.map((line) => JSON.parse(line));
+          } catch {
+            throw new Error(
+              "Invalid JSON format: expected JSON or JSONL format"
+            );
+          }
+        }
+      } else {
+        // Handle direct JSON string or JSONL string
+        try {
+          jsonData = JSON.parse(selectedDataSetObj.dataSets);
+        } catch {
+          // Try parsing as JSONL format
+          try {
+            const lines = selectedDataSetObj.dataSets
+              .trim()
+              .split("\n")
+              .filter((line) => line.trim());
+            jsonData = lines.map((line) => JSON.parse(line));
+          } catch {
+            throw new Error("Invalid JSON format in dataset");
+          }
+        }
       }
 
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const flattenObject = (obj: any, prefix = ""): any => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const flattened: any = {};
+
+        for (const key in obj) {
+          if (obj.hasOwnProperty(key)) {
+            const newKey = prefix ? `${prefix}.${key}` : key;
+
+            if (
+              obj[key] !== null &&
+              typeof obj[key] === "object" &&
+              !Array.isArray(obj[key])
+            ) {
+              // Recursively flatten nested objects
+              Object.assign(flattened, flattenObject(obj[key], newKey));
+            } else if (Array.isArray(obj[key])) {
+              // Handle arrays by taking the first element if it's an object
+              if (obj[key].length > 0 && typeof obj[key][0] === "object") {
+                Object.assign(flattened, flattenObject(obj[key][0], newKey));
+              } else {
+                flattened[newKey] = obj[key];
+              }
+            } else {
+              flattened[newKey] = obj[key];
+            }
+          }
+        }
+
+        return flattened;
+      };
+
       if (!Array.isArray(jsonData)) {
-        throw new Error("Invalid data format: expected array");
+        if (typeof jsonData === "object" && jsonData !== null) {
+          jsonData = [jsonData]; // Convert single object to array
+        } else {
+          throw new Error("Invalid data format: expected object or array");
+        }
+      }
+
+      if (jsonData.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        jsonData = jsonData.map((item: any) => {
+          if (typeof item === "object" && item !== null) {
+            return flattenObject(item);
+          }
+          return item;
+        });
+      }
+
+      if (jsonData.length === 0) {
+        setRawData([]);
+        setAvailableFields([]);
+        setError(null); // No error for empty data
+        return;
       }
 
       setRawData(jsonData);
@@ -181,7 +274,11 @@ export default function DynamicUserDashboard() {
       resetFilters();
     } catch (error) {
       console.error("Error loading dataset content:", error);
-      setError("Failed to load dataset content");
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Failed to load dataset content"
+      );
       setRawData([]);
       setAvailableFields([]);
     } finally {
@@ -424,6 +521,7 @@ export default function DynamicUserDashboard() {
 
     setFilteredData(filtered);
     generateChartData(filtered);
+    // eslint-disable-next-line
   }, [rawData, filters, fieldsByType.date]);
 
   const generateChartData = useCallback(
@@ -497,9 +595,8 @@ export default function DynamicUserDashboard() {
             y: Number(value),
           }));
         } else {
-          // Use data index if no date field
           newChartData.lineChart = data.slice(0, 20).map((item, index) => ({
-            x: `Point ${index + 1}`,
+            x: `P${index + 1}`,
             y:
               typeof item[primaryMetric] === "number"
                 ? item[primaryMetric]
@@ -525,7 +622,7 @@ export default function DynamicUserDashboard() {
         }, {} as Record<string, number>);
 
         newChartData.pieChart = Object.entries(groupedByDimension)
-          .sort(([, a], [, b]) => Number(b ?? 0) - Number(a ?? 0))
+          .sort(([, a], [, b]) => (Number(b ?? 0) - Number(a ?? 0)))
           .slice(0, 8)
           .map(([name, value], index) => ({
             name,
@@ -536,7 +633,7 @@ export default function DynamicUserDashboard() {
 
       setChartData(newChartData);
     },
-    [selectedMetrics, selectedDimensions, fieldsByType.date]
+    [selectedMetrics, selectedDimensions, fieldsByType]
   );
 
   const updateNumericFilter = (
@@ -662,6 +759,24 @@ export default function DynamicUserDashboard() {
     );
   }
 
+  if (selectedDataSet && rawData.length === 0 && !dataLoading && !error) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <Card className="w-96">
+          <CardContent className="p-8 text-center">
+            <div className="text-6xl mb-4">📈</div>
+            <h2 className="text-2xl font-bold mb-2">No Data Available</h2>
+            <p className="text-gray-600 mb-4">
+              The selected dataset appears to be empty or contains no valid
+              data.
+            </p>
+            <Button onClick={loadDataSetContent}>Reload Data</Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="max-w-7xl mx-auto">
@@ -696,7 +811,7 @@ export default function DynamicUserDashboard() {
                 {availableFields.length > 0 && (
                   <>
                     <div>
-                      <Label className="text-sm font-medium mb-2  flex items-center gap-2">
+                      <Label className="text-sm font-medium mb-2 flex items-center gap-2">
                         <Type className="w-4 h-4" />
                         Search All Fields
                       </Label>
@@ -714,7 +829,7 @@ export default function DynamicUserDashboard() {
 
                     {fieldsByType.date.length > 0 && (
                       <div>
-                        <Label className="text-sm font-medium mb-2  flex items-center gap-2">
+                        <Label className="text-sm font-medium mb-2 flex items-center gap-2">
                           <Calendar className="w-4 h-4" />
                           Date Range ({fieldsByType.date[0].name})
                         </Label>
@@ -749,7 +864,7 @@ export default function DynamicUserDashboard() {
 
                     {fieldsByType.numeric.length > 0 && (
                       <div>
-                        <Label className="text-sm font-medium mb-2  flex items-center gap-2">
+                        <Label className="text-sm font-medium mb-2 flex items-center gap-2">
                           <Hash className="w-4 h-4" />
                           Numeric Ranges
                         </Label>
@@ -1092,21 +1207,29 @@ export default function DynamicUserDashboard() {
                             const maxValue = Math.max(
                               ...chartData.lineChart.map((d) => d.y)
                             );
-                            const step = maxValue / 5;
-                            return Array.from({ length: 6 }, (_, i) => (
-                              <text
-                                key={i}
-                                x="40"
-                                y={45 + i * 32}
-                                fontSize="12"
-                                fill="#6b7280"
-                                textAnchor="end"
-                              >
-                                {Math.round(
-                                  maxValue - i * step
-                                ).toLocaleString()}
-                              </text>
-                            ));
+                            const minValue = Math.min(
+                              ...chartData.lineChart.map((d) => d.y)
+                            );
+                            const range = maxValue - minValue;
+                            const step = range / 5;
+
+                            return Array.from({ length: 6 }, (_, i) => {
+                              const value = minValue + i * step;
+                              return (
+                                <text
+                                  key={i}
+                                  x="40"
+                                  y={200 - 5 - i * 32}
+                                  fontSize="12"
+                                  fill="#6b7280"
+                                  textAnchor="end"
+                                >
+                                  {value >= 1000
+                                    ? `${(value / 1000).toFixed(1)}k`
+                                    : Math.round(value).toLocaleString()}
+                                </text>
+                              );
+                            });
                           })()}
 
                           {/* Line chart */}
@@ -1120,11 +1243,18 @@ export default function DynamicUserDashboard() {
                                   const maxValue = Math.max(
                                     ...chartData.lineChart.map((d) => d.y)
                                   );
+                                  const minValue = Math.min(
+                                    ...chartData.lineChart.map((d) => d.y)
+                                  );
+                                  const range = maxValue - minValue || 1;
                                   const x =
                                     50 +
                                     (index * 700) /
                                       (chartData.lineChart.length - 1);
-                                  const y = 180 - (point.y / maxValue) * 140;
+                                  const y =
+                                    200 -
+                                    40 -
+                                    ((point.y - minValue) / range) * 120;
                                   return `${x},${y}`;
                                 })
                                 .join(" ")}
@@ -1136,11 +1266,16 @@ export default function DynamicUserDashboard() {
                             const maxValue = Math.max(
                               ...chartData.lineChart.map((d) => d.y)
                             );
+                            const minValue = Math.min(
+                              ...chartData.lineChart.map((d) => d.y)
+                            );
+                            const range = maxValue - minValue || 1;
                             const x =
                               50 +
                               (index * 700) /
                                 Math.max(1, chartData.lineChart.length - 1);
-                            const y = 180 - (point.y / maxValue) * 140;
+                            const y =
+                              200 - 40 - ((point.y - minValue) / range) * 120;
                             return (
                               <circle
                                 key={index}
@@ -1154,6 +1289,11 @@ export default function DynamicUserDashboard() {
 
                           {/* X-axis labels */}
                           {chartData.lineChart.map((point, index) => {
+                            if (
+                              index % 3 !== 0 &&
+                              index !== chartData.lineChart.length - 1
+                            )
+                              return null;
                             const x =
                               50 +
                               (index * 700) /
@@ -1163,7 +1303,7 @@ export default function DynamicUserDashboard() {
                                 key={index}
                                 x={x}
                                 y="195"
-                                fontSize="12"
+                                fontSize="10"
                                 fill="#6b7280"
                                 textAnchor="middle"
                               >
